@@ -41,6 +41,12 @@ def POS(xp, x):
 # resize and crop images for face reconstruction
 def resize_n_crop_img(img, lm, t, s, target_size=224., mask=None):
     w0, h0 = img.size
+    # Convert to numpy arrays for calculations
+    w0 = np.array(w0, dtype=np.float64)
+    h0 = np.array(h0, dtype=np.float64)
+    s = np.array(s, dtype=np.float64)
+    t = np.array(t, dtype=np.float64)
+    
     w = (w0*s).astype(np.int32)
     h = (h0*s).astype(np.int32)
     left = (w/2 - target_size/2 + float((t[0] - w0/2)*s)).astype(np.int32)
@@ -96,8 +102,17 @@ def align_img(img, lm, lm3D, mask=None, target_size=224., rescale_factor=102.):
     t, s = POS(lm5p.transpose(), lm3D.transpose())
     s = rescale_factor/s
 
+    # ensure all elements are float64 for consistent array shape
+    w0 = float(w0)
+    h0 = float(h0)
+    s = float(s)
+    t = np.array([float(t[0]), float(t[1])], dtype=np.float64)
+    
+    # Create trans_params with explicit dtype
+    trans_params = np.array([w0, h0, s, float(t[0]), float(t[1])], dtype=np.float64)
+    
     # processing the image
     img_new, lm_new, mask_new = resize_n_crop_img(img, lm, t, s, target_size=target_size, mask=mask)
-    trans_params = np.array([w0, h0, s, t[0], t[1]])
 
     return trans_params, img_new, lm_new, mask_new
+

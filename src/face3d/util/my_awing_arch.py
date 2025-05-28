@@ -15,7 +15,7 @@ def calculate_points(heatmaps):
     indexes = np.argmax(heatline, axis=2)
 
     preds = np.stack((indexes % W, indexes // W), axis=2)
-    preds = preds.astype(np.float, copy=False)
+    preds = preds.astype(np.float64, copy=False)  # Changed from np.float to np.float64
 
     inr = indexes.ravel()
 
@@ -376,3 +376,4 @@ class FAN(nn.Module):
         pred += offset[-2:]
 
         return pred
+
