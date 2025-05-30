@@ -573,13 +573,16 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
 @app.websocket("/generate/stream")
 async def generate_video_stream(websocket: WebSocket):
     """Generate and stream talking face video frames with audio sync through WebSocket"""
+    client_id = None
+    temp_dir = None
+    result_dir = None
+    all_tasks = set()
+    
     try:
         logger.info("WebSocket connection request received")
         await websocket.accept()
         client_id = str(uuid.uuid4())
         active_connections.add(websocket)
-        temp_dir = None
-        result_dir = None
         
         logger.info(f"[{client_id}] WebSocket connection accepted")
         
@@ -642,9 +645,8 @@ async def generate_video_stream(websocket: WebSocket):
             })
             return
 
-        # Split audio into chunks
-        audio = AudioSegment.from_file(audio_path)
-        chunk_length_ms = 2000  # 2 second chunks
+        # Split audio into 3-second chunks
+        chunk_length_ms = 3000  # 4 second chunks
         total_chunks = len(audio) // chunk_length_ms + (1 if len(audio) % chunk_length_ms > 0 else 0)
         
         # Send initial info
@@ -654,11 +656,17 @@ async def generate_video_stream(websocket: WebSocket):
             "chunk_duration": chunk_length_ms / 1000
         })
 
-        # Process chunks in parallel while streaming
+        # Process chunks with streaming optimization
+        all_tasks = set()  # Track all tasks (both processing and streaming)
         processing_tasks = set()
+        streaming_tasks = set()
         current_chunk = 0
+        next_chunk_to_stream = 0
+        chunk_progress = {}  # Track progress of each chunk
+        chunk_results = {}  # Store results of processed chunks
         
         async def process_chunk(chunk_index: int):
+            """Process a single chunk of video"""
             try:
                 # Create chunk directory first
                 chunk_dir = os.path.join(result_dir, f"chunk_{chunk_index}")
@@ -679,11 +687,17 @@ async def generate_video_stream(websocket: WebSocket):
                 chunk.export(chunk_path, format="wav")
                 logger.info(f"[{client_id}] Saved audio chunk {chunk_index} to: {chunk_path}")
                 
+                # Initialize progress for this chunk
+                chunk_progress[chunk_index] = 0
+                
                 # Process chunk using the preloaded model instance
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     with torch.no_grad():
-                        # Use test_with_preloaded_models instead of test
                         with suppress_stdout():
+                            # Start a background task to monitor progress
+                            progress_task = asyncio.create_task(monitor_chunk_progress(chunk_index))
+                            all_tasks.add(progress_task)
+                            
                             result_path = sad_talker.test_with_preloaded_models(
                                 source_image=chunk_image_path,
                                 driven_audio=chunk_path,
@@ -695,6 +709,17 @@ async def generate_video_stream(websocket: WebSocket):
                                 pose_style=0,
                                 result_dir=chunk_dir
                             )
+                            
+                            # Store the result
+                            chunk_results[chunk_index] = result_path
+                            
+                            # Cancel progress monitoring when done
+                            progress_task.cancel()
+                            all_tasks.remove(progress_task)
+                            try:
+                                await progress_task
+                            except asyncio.CancelledError:
+                                pass
                 
                 logger.info(f"[{client_id}] Chunk {chunk_index} processed successfully")
                 return chunk_index, result_path
@@ -702,85 +727,147 @@ async def generate_video_stream(websocket: WebSocket):
                 logger.error(f"[{client_id}] Error processing chunk {chunk_index}: {str(e)}")
                 return chunk_index, None
 
-        async def stream_chunk(chunk_index: int, video_path: str):
+        async def monitor_chunk_progress(chunk_index: int):
+            """Monitor the progress of chunk processing"""
             try:
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    raise RuntimeError(f"Could not open video file {video_path}")
+                while True:
+                    # Update progress every 0.5 seconds
+                    await asyncio.sleep(0.5)
+                    chunk_progress[chunk_index] += 0.5
+                    
+                    # If this is chunk 1 and it's halfway done, trigger streaming of chunk 0
+                    if chunk_index == 1 and chunk_progress[chunk_index] >= 1.5:  # Halfway point
+                        if 0 not in streaming_tasks and 0 in chunk_results:
+                            result_path = chunk_results[0]
+                            if result_path and os.path.exists(result_path):
+                                stream_task = asyncio.create_task(stream_chunk(0, result_path))
+                                streaming_tasks.add(stream_task)
+                                all_tasks.add(stream_task)
+                                next_chunk_to_stream = 1
+                                logger.info(f"[{client_id}] Starting to stream chunk 0 as chunk 1 is halfway done")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[{client_id}] Error monitoring chunk {chunk_index} progress: {str(e)}")
+
+        async def stream_chunk(chunk_index: int, video_path: str):
+            """Stream a processed video chunk"""
+            try:
+                # Get audio URL for this chunk
+                audio_url = f"/audio/chunk/{client_id}/{chunk_index}"
                 
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                # Create FFmpeg command to stream video with audio
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-i', video_path,  # Input video file
+                    '-f', 'webm',      # Output format (WebM for better browser support)
+                    '-c:v', 'libvpx',  # Video codec
+                    '-c:a', 'libopus', # Audio codec
+                    '-b:v', '1M',      # Video bitrate
+                    '-b:a', '128k',    # Audio bitrate
+                    '-deadline', 'realtime',  # Real-time encoding
+                    '-cpu-used', '4',  # Faster encoding
+                    '-f', 'webm',      # Output format
+                    'pipe:1'           # Output to stdout
+                ]
+                
+                # Start FFmpeg process
+                process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
                 
                 # Send chunk info
                 await websocket.send_json({
                     "type": "chunk_ready",
                     "chunk_index": chunk_index,
-                    "fps": fps,
-                    "frame_count": frame_count
+                    "audio_url": audio_url,
+                    "chunk_start_time": chunk_index * (chunk_length_ms / 1000),
+                    "format": "webm"
                 })
                 
-                frame_index = 0
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
+                # Stream the video data
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while True:
+                    chunk = await process.stdout.read(chunk_size)
+                    if not chunk:
                         break
+                        
+                    # Send video chunk
+                    await websocket.send_bytes(chunk)
                     
-                    # Process frame
-                    frame = cv2.resize(frame, (VIDEO_SIZE, VIDEO_SIZE))
-                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    
-                    # Send frame
-                    await websocket.send_json({
-                        "type": "frame",
-                        "chunk_index": chunk_index,
-                        "frame_index": frame_index,
-                        "data": base64.b64encode(buffer).decode('utf-8')
-                    })
-                    
-                    frame_index += 1
-                    await asyncio.sleep(1/fps)
+                # Wait for FFmpeg to finish
+                await process.wait()
                 
-                cap.release()
+                if process.returncode != 0:
+                    stderr = await process.stderr.read()
+                    raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
+                    
+                logger.info(f"[{client_id}] Finished streaming chunk {chunk_index}")
                 
             except Exception as e:
                 logger.error(f"Error streaming chunk {chunk_index}: {str(e)}")
                 raise
 
-        # Start processing first chunk
-        processing_tasks.add(asyncio.create_task(process_chunk(0)))
+        # Start processing first two chunks
+        task0 = asyncio.create_task(process_chunk(0))
+        processing_tasks.add(task0)
+        all_tasks.add(task0)
         
-        while current_chunk < total_chunks:
-            # Wait for next chunk to be ready
+        if total_chunks > 1:
+            task1 = asyncio.create_task(process_chunk(1))
+            processing_tasks.add(task1)
+            all_tasks.add(task1)
+        
+        while current_chunk < total_chunks or all_tasks:
+            if not all_tasks:
+                break
+                
+            # Wait for any task to complete
             done, pending = await asyncio.wait(
-                processing_tasks,
+                all_tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
             
             for task in done:
-                chunk_index, result_path = await task
-                processing_tasks.remove(task)
+                all_tasks.remove(task)
                 
-                if result_path and os.path.exists(result_path):
-                    # Stream this chunk
-                    await stream_chunk(chunk_index, result_path)
+                if task in processing_tasks:
+                    processing_tasks.remove(task)
+                    chunk_index, result_path = await task
                     
-                    # Start processing next chunk if available
-                    next_chunk = chunk_index + 1
-                    if next_chunk < total_chunks:
-                        processing_tasks.add(asyncio.create_task(process_chunk(next_chunk)))
-                    
-                    current_chunk = next_chunk
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": f"Failed to process chunk {chunk_index}"
-                    })
-                    raise RuntimeError(f"Failed to process chunk {chunk_index}")
-
-        # Wait for any remaining processing tasks
-        if processing_tasks:
-            await asyncio.wait(processing_tasks)
-        
+                    if result_path and os.path.exists(result_path):
+                        # For chunks after the first two, start streaming when ready
+                        if chunk_index >= 2 and chunk_index == next_chunk_to_stream:
+                            stream_task = asyncio.create_task(stream_chunk(chunk_index, result_path))
+                            streaming_tasks.add(stream_task)
+                            all_tasks.add(stream_task)
+                            next_chunk_to_stream += 1
+                            
+                            # Start processing next chunk if available
+                            next_chunk = chunk_index + 1
+                            if next_chunk < total_chunks:
+                                new_task = asyncio.create_task(process_chunk(next_chunk))
+                                processing_tasks.add(new_task)
+                                all_tasks.add(new_task)
+                        
+                        current_chunk = chunk_index + 1
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": f"Failed to process chunk {chunk_index}"
+                        })
+                        raise RuntimeError(f"Failed to process chunk {chunk_index}")
+                
+                elif task in streaming_tasks:
+                    streaming_tasks.remove(task)
+                    try:
+                        await task
+                    except Exception as e:
+                        logger.error(f"Error in streaming task: {str(e)}")
+                        raise
+            
         await websocket.send_json({
             "type": "complete",
             "message": "All chunks processed and streamed"
@@ -790,19 +877,31 @@ async def generate_video_stream(websocket: WebSocket):
         logger.info("Client disconnected")
     except Exception as e:
         logger.error(f"Stream error: {str(e)}", exc_info=True)
-        await websocket.send_json({
-            "type": "error",
-            "error": str(e)
-        })
+        if websocket.client_state.CONNECTED:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e)
+            })
     finally:
-        active_connections.remove(websocket)
-        # Clean up temp files
+        # Cancel any remaining tasks
+        for task in all_tasks:
+            task.cancel()
         try:
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-        except Exception as e:
-            logger.warning(f"Error cleaning up temp directory: {str(e)}")
-        await websocket.close()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+        except Exception:
+            pass
+        
+        if client_id:
+            active_connections.remove(websocket)
+            # Clean up temp files
+            try:
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception as e:
+                logger.warning(f"Error cleaning up temp directory: {str(e)}")
+        
+        if websocket.client_state.CONNECTED:
+            await websocket.close()
 
 @app.get("/audio/{client_id}")
 async def get_audio(client_id: str):

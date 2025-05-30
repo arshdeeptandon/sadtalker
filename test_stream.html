@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SadTalker Stream Test</title>
+    <style>
+        #videoCanvas {
+            border: 1px solid black;
+            max-width: 100%;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success { background-color: #dff0d8; }
+        .error { background-color: #f2dede; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SadTalker Stream Test</h1>
+        <div id="status">Status: Not connected</div>
+        <div>
+            <input type="file" id="imageInput" accept="image/*" />
+            <input type="file" id="audioInput" accept="audio/*" />
+            <button onclick="startStream()">Start Stream</button>
+        </div>
+        <canvas id="videoCanvas"></canvas>
+    </div>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        let ws = null;
+
+        function updateStatus(message, isError = false) {
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = isError ? 'error' : 'success';
+        }
+
+        async function startStream() {
+            const imageFile = document.getElementById('imageInput').files[0];
+            const audioFile = document.getElementById('audioInput').files[0];
+
+            if (!imageFile || !audioFile) {
+                updateStatus('Please select both image and audio files', true);
+                return;
+            }
+
+            try {
+                // Connect to WebSocket
+                ws = new WebSocket(`ws://13.232.96.15:8000/generate/stream`);
+                
+                ws.onopen = () => {
+                    updateStatus('Connected to server');
+                };
+
+                ws.onerror = (error) => {
+                    updateStatus('WebSocket error: ' + error.message, true);
+                };
+
+                ws.onclose = () => {
+                    updateStatus('Connection closed');
+                };
+
+                ws.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'error') {
+                        updateStatus('Error: ' + data.error, true);
+                        return;
+                    }
+
+                    if (data.type === 'frame') {
+                        // Convert base64 to image and display
+                        const img = new Image();
+                        img.onload = () => {
+                            canvas.width = img.width;
+                            canvas.height = img.height;
+                            ctx.drawImage(img, 0, 0);
+                        };
+                        img.src = 'data:image/jpeg;base64,' + data.data;
+                    }
+                };
+
+                // Wait for connection to establish
+                await new Promise(resolve => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        resolve();
+                    } else {
+                        ws.onopen = resolve;
+                    }
+                });
+
+                // Read and send image
+                const imageData = await imageFile.arrayBuffer();
+                ws.send(imageData);
+
+                // Read and send audio
+                const audioData = await audioFile.arrayBuffer();
+                ws.send(audioData);
+
+                updateStatus('Streaming started');
+
+            } catch (error) {
+                updateStatus('Error: ' + error.message, true);
+            }
+        }
+    </script>
+</body>
+</html> 
