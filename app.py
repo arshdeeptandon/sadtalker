@@ -26,8 +26,12 @@ import time
 import subprocess
 import sys
 from contextlib import contextmanager
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
+
+# Add static file serving for examples directory
+app.mount("/examples", StaticFiles(directory="examples"), name="examples")
 
 # Add CORS middleware
 app.add_middleware(
@@ -570,11 +574,21 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
         logger.error(f"Error streaming chunk {chunk_index}: {str(e)}", exc_info=True)
         raise
 
-@app.websocket("/generate/stream")
-async def generate_video_stream(websocket: WebSocket):
-    """Generate and stream talking face video frames with audio sync through WebSocket"""
+@app.websocket("/ws/generate_video_stream")
+async def websocket_generate_video(websocket: WebSocket):
+    """WebSocket endpoint for video generation and streaming.
+    
+    Expected message sequence:
+    1. First message: Image file as bytes
+    2. Second message: Audio file as bytes
+    
+    The endpoint will then:
+    1. Process the video generation
+    2. Stream the generated frames
+    3. Send audio URLs for synchronization
+    """
     try:
-        logger.info("WebSocket connection request received")
+        logger.info("WebSocket connection request received for /ws/generate_video_stream")
         await websocket.accept()
         client_id = str(uuid.uuid4())
         active_connections.add(websocket)
@@ -583,36 +597,112 @@ async def generate_video_stream(websocket: WebSocket):
         
         logger.info(f"[{client_id}] WebSocket connection accepted")
         
-        # Create temporary and result directories first
-        temp_dir = os.path.join("temp", client_id)
-        result_dir = os.path.join("results", client_id)
-        os.makedirs(temp_dir, exist_ok=True)
-        os.makedirs(result_dir, exist_ok=True)
-        logger.info(f"[{client_id}] Created directories: {temp_dir} and {result_dir}")
-        
-        # Receive both files with timeout
         try:
-            # Receive image
+            # Create temporary and result directories
+            temp_dir = os.path.join("temp", client_id)
+            result_dir = os.path.join("results", client_id)
+            os.makedirs(temp_dir, exist_ok=True)
+            os.makedirs(result_dir, exist_ok=True)
+            logger.info(f"[{client_id}] Created directories: {temp_dir} and {result_dir}")
+            
+            # Wait for image data with timeout
             logger.info(f"[{client_id}] Waiting for image data...")
-            image_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
-            logger.info(f"[{client_id}] Received image data: {len(image_data)} bytes")
+            try:
+                image_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
+                logger.info(f"[{client_id}] Received image data: {len(image_data)} bytes")
+                logger.info(f"[{client_id}] Image data first 100 bytes: {image_data[:100]}")
+            except asyncio.TimeoutError:
+                logger.error(f"[{client_id}] Timeout waiting for image data")
+                raise
+            except Exception as e:
+                logger.error(f"[{client_id}] Error receiving image data: {str(e)}")
+                raise
             
-            # Save image immediately
+            # Save image
             image_path = os.path.join(temp_dir, "source_image.png")
-            with open(image_path, "wb") as f:
-                f.write(image_data)
-            logger.info(f"[{client_id}] Saved source image to: {image_path}")
+            try:
+                with open(image_path, "wb") as f:
+                    f.write(image_data)
+                logger.info(f"[{client_id}] Saved source image to: {image_path}")
+                # Verify image was saved correctly
+                if os.path.exists(image_path):
+                    logger.info(f"[{client_id}] Verified image file exists, size: {os.path.getsize(image_path)} bytes")
+                else:
+                    raise FileNotFoundError(f"Image file was not saved correctly at {image_path}")
+            except Exception as e:
+                logger.error(f"[{client_id}] Error saving image file: {str(e)}")
+                raise
             
-            # Receive audio immediately after
+            # Wait for audio data with timeout
             logger.info(f"[{client_id}] Waiting for audio data...")
-            audio_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
-            logger.info(f"[{client_id}] Received audio data: {len(audio_data)} bytes")
+            try:
+                audio_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
+                logger.info(f"[{client_id}] Received audio data: {len(audio_data)} bytes")
+                logger.info(f"[{client_id}] Audio data first 100 bytes: {audio_data[:100]}")
+            except asyncio.TimeoutError:
+                logger.error(f"[{client_id}] Timeout waiting for audio data")
+                raise
+            except Exception as e:
+                logger.error(f"[{client_id}] Error receiving audio data: {str(e)}")
+                raise
             
-            # Save audio immediately
+            # Save audio
             audio_path = os.path.join(temp_dir, "audio.wav")
-            with open(audio_path, "wb") as f:
-                f.write(audio_data)
-            logger.info(f"[{client_id}] Saved audio file to: {audio_path}")
+            try:
+                with open(audio_path, "wb") as f:
+                    f.write(audio_data)
+                logger.info(f"[{client_id}] Saved audio file to: {audio_path}")
+                # Verify audio was saved correctly
+                if os.path.exists(audio_path):
+                    logger.info(f"[{client_id}] Verified audio file exists, size: {os.path.getsize(audio_path)} bytes")
+                else:
+                    raise FileNotFoundError(f"Audio file was not saved correctly at {audio_path}")
+            except Exception as e:
+                logger.error(f"[{client_id}] Error saving audio file: {str(e)}")
+                raise
+            
+            # Verify audio file
+            try:
+                audio = AudioSegment.from_file(audio_path)
+                logger.info(f"[{client_id}] Audio loaded successfully: {len(audio)}ms duration, {audio.channels} channels, {audio.frame_rate}Hz")
+            except Exception as e:
+                logger.error(f"[{client_id}] Error loading audio file: {str(e)}")
+                await websocket.send_json({
+                    "type": "error",
+                    "error": f"Error loading audio file: {str(e)}"
+                })
+                return
+            
+            # Send processing started message
+            await websocket.send_json({
+                "type": "processing_started",
+                "message": "Starting video generation"
+            })
+            logger.info(f"[{client_id}] Sent processing started message")
+            
+            # Process the video
+            try:
+                logger.info(f"[{client_id}] Starting video generation with image: {image_path} and audio: {audio_path}")
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    result_path = await process_video(image_path, audio_path, websocket)
+                
+                logger.info(f"[{client_id}] Video generation completed. Result path: {result_path}")
+                
+                # Send completion message
+                await websocket.send_json({
+                    "type": "complete",
+                    "message": "Video generation completed",
+                    "result_path": result_path
+                })
+                logger.info(f"[{client_id}] Sent completion message")
+                
+            except Exception as e:
+                logger.error(f"[{client_id}] Error during video generation: {str(e)}", exc_info=True)
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e)
+                })
+                raise
             
         except asyncio.TimeoutError:
             logger.error(f"[{client_id}] Timeout waiting for files")
@@ -620,189 +710,36 @@ async def generate_video_stream(websocket: WebSocket):
                 "type": "error",
                 "error": "Timeout waiting for files"
             })
-            return
         except Exception as e:
-            logger.error(f"[{client_id}] Error receiving files: {str(e)}")
+            logger.error(f"[{client_id}] Error processing request: {str(e)}", exc_info=True)
             await websocket.send_json({
                 "type": "error",
-                "error": f"Error receiving files: {str(e)}"
+                "error": str(e)
             })
-            return
-
-        # Verify audio file is valid
-        try:
-            logger.info(f"[{client_id}] Loading audio file for chunking...")
-            audio = AudioSegment.from_file(audio_path)
-            logger.info(f"[{client_id}] Audio loaded successfully: {len(audio)}ms duration")
-        except Exception as e:
-            logger.error(f"[{client_id}] Error loading audio file: {str(e)}")
-            await websocket.send_json({
-                "type": "error",
-                "error": f"Error loading audio file: {str(e)}"
-            })
-            return
-
-        # Split audio into chunks
-        audio = AudioSegment.from_file(audio_path)
-        chunk_length_ms = 2000  # 2 second chunks
-        total_chunks = len(audio) // chunk_length_ms + (1 if len(audio) % chunk_length_ms > 0 else 0)
-        
-        # Send initial info
-        await websocket.send_json({
-            "type": "processing_started",
-            "total_chunks": total_chunks,
-            "chunk_duration": chunk_length_ms / 1000
-        })
-
-        # Process chunks in parallel while streaming
-        processing_tasks = set()
-        current_chunk = 0
-        
-        async def process_chunk(chunk_index: int):
-            try:
-                # Create chunk directory first
-                chunk_dir = os.path.join(result_dir, f"chunk_{chunk_index}")
-                os.makedirs(chunk_dir, exist_ok=True)
-                
-                # Copy source image to chunk directory
-                chunk_image_path = os.path.join(chunk_dir, "source_image.png")
-                shutil.copy2(image_path, chunk_image_path)
-                logger.info(f"[{client_id}] Copied source image to chunk directory: {chunk_image_path}")
-                
-                # Extract chunk
-                start_ms = chunk_index * chunk_length_ms
-                end_ms = min((chunk_index + 1) * chunk_length_ms, len(audio))
-                chunk = audio[start_ms:end_ms]
-                
-                # Save chunk
-                chunk_path = os.path.join(temp_dir, f"audio_chunk_{chunk_index}.wav")
-                chunk.export(chunk_path, format="wav")
-                logger.info(f"[{client_id}] Saved audio chunk {chunk_index} to: {chunk_path}")
-                
-                # Process chunk using the preloaded model instance
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    with torch.no_grad():
-                        # Use test_with_preloaded_models instead of test
-                        with suppress_stdout():
-                            result_path = sad_talker.test_with_preloaded_models(
-                                source_image=chunk_image_path,
-                                driven_audio=chunk_path,
-                                preprocess='full',
-                                still_mode=True,
-                                use_enhancer=False,
-                                batch_size=1,
-                                size=VIDEO_SIZE,
-                                pose_style=0,
-                                result_dir=chunk_dir
-                            )
-                
-                logger.info(f"[{client_id}] Chunk {chunk_index} processed successfully")
-                return chunk_index, result_path
-            except Exception as e:
-                logger.error(f"[{client_id}] Error processing chunk {chunk_index}: {str(e)}")
-                return chunk_index, None
-
-        async def stream_chunk(chunk_index: int, video_path: str):
-            try:
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    raise RuntimeError(f"Could not open video file {video_path}")
-                
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                
-                # Send chunk info
-                await websocket.send_json({
-                    "type": "chunk_ready",
-                    "chunk_index": chunk_index,
-                    "fps": fps,
-                    "frame_count": frame_count
-                })
-                
-                frame_index = 0
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    # Process frame
-                    frame = cv2.resize(frame, (VIDEO_SIZE, VIDEO_SIZE))
-                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    
-                    # Send frame
-                    await websocket.send_json({
-                        "type": "frame",
-                        "chunk_index": chunk_index,
-                        "frame_index": frame_index,
-                        "data": base64.b64encode(buffer).decode('utf-8')
-                    })
-                    
-                    frame_index += 1
-                    await asyncio.sleep(1/fps)
-                
-                cap.release()
-                
-            except Exception as e:
-                logger.error(f"Error streaming chunk {chunk_index}: {str(e)}")
-                raise
-
-        # Start processing first chunk
-        processing_tasks.add(asyncio.create_task(process_chunk(0)))
-        
-        while current_chunk < total_chunks:
-            # Wait for next chunk to be ready
-            done, pending = await asyncio.wait(
-                processing_tasks,
-                return_when=asyncio.FIRST_COMPLETED
-            )
+            raise
             
-            for task in done:
-                chunk_index, result_path = await task
-                processing_tasks.remove(task)
-                
-                if result_path and os.path.exists(result_path):
-                    # Stream this chunk
-                    await stream_chunk(chunk_index, result_path)
-                    
-                    # Start processing next chunk if available
-                    next_chunk = chunk_index + 1
-                    if next_chunk < total_chunks:
-                        processing_tasks.add(asyncio.create_task(process_chunk(next_chunk)))
-                    
-                    current_chunk = next_chunk
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": f"Failed to process chunk {chunk_index}"
-                    })
-                    raise RuntimeError(f"Failed to process chunk {chunk_index}")
-
-        # Wait for any remaining processing tasks
-        if processing_tasks:
-            await asyncio.wait(processing_tasks)
-        
-        await websocket.send_json({
-            "type": "complete",
-            "message": "All chunks processed and streamed"
-        })
-        
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info(f"[{client_id}] Client disconnected")
     except Exception as e:
-        logger.error(f"Stream error: {str(e)}", exc_info=True)
-        await websocket.send_json({
-            "type": "error",
-            "error": str(e)
-        })
+        logger.error(f"[{client_id}] WebSocket error: {str(e)}", exc_info=True)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e)
+            })
+        except:
+            pass
     finally:
         active_connections.remove(websocket)
         # Clean up temp files
         try:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+                logger.info(f"[{client_id}] Cleaned up temp directory: {temp_dir}")
         except Exception as e:
-            logger.warning(f"Error cleaning up temp directory: {str(e)}")
+            logger.warning(f"[{client_id}] Error cleaning up temp directory: {str(e)}")
         await websocket.close()
+        logger.info(f"[{client_id}] WebSocket connection closed")
 
 @app.get("/audio/{client_id}")
 async def get_audio(client_id: str):
@@ -883,6 +820,17 @@ async def get_status(task_id: str):
     if task_id not in generation_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return generation_tasks[task_id]
+
+# Add a general status endpoint
+@app.get("/status")
+async def get_general_status():
+    """Get general server status"""
+    return {
+        "status": "running",
+        "active_connections": len(active_connections),
+        "active_tasks": len(generation_tasks),
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
 
 @app.get("/download/chunk/{client_id}/{chunk_index}")
 async def download_chunk(client_id: str, chunk_index: int):

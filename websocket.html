@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SadTalker Video Stream</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .video-container {
+            margin-top: 20px;
+            position: relative;
+            width: 256px;
+            height: 256px;
+            margin: 20px auto;
+            background-color: #000;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        #videoCanvas {
+            max-width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background-color: #000;
+            display: block;
+            width: 256px;
+            height: 256px;
+            object-fit: contain;
+        }
+        #videoPlayer {
+            display: none;
+        }
+        .loading-spinner {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 50px;
+            height: 50px;
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: translate(-50%, -50%) rotate(0deg); }
+            100% { transform: translate(-50%, -50%) rotate(360deg); }
+        }
+        .video-loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 16px;
+            text-align: center;
+            display: none;
+        }
+        .progress-bar {
+            display: none;
+        }
+        .download-btn {
+            display: none;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 18px;
+            margin: 10px;
+            min-width: 200px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin: 20px 0;
+            padding: 15px;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        .status.connected {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        .status.disconnected {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+        .status.processing {
+            background-color: #d9edf7;
+            color: #31708f;
+        }
+        .error {
+            color: #dc3545;
+            background-color: #f8d7da;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SadTalker Video Stream</h1>
+        
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <button id="startBtn" onclick="startStreaming()">Start Streaming</button>
+        <button id="stopBtn" onclick="stopStreaming()" disabled>Stop Streaming</button>
+        
+        <div class="video-container">
+            <canvas id="videoCanvas" width="256" height="256"></canvas>
+            <div id="loadingSpinner" class="loading-spinner"></div>
+        </div>
+        <div id="error" class="error" style="display: none;"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let isStreaming = false;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 3;
+        const RECONNECT_DELAY = 2000; // 2 seconds
+
+        // Add audio context and buffer
+        let audioContext = null;
+        let audioBuffer = null;
+        let audioSource = null;
+        let audioStartTime = 0;
+        let isAudioPlaying = false;
+        let currentChunkIndex = -1;
+        let chunkAudioBuffers = new Map(); // Store audio buffers for each chunk
+        let pendingChunks = new Set(); // Track chunks waiting for audio
+        const CHUNK_DURATION = 3; // 3 seconds per chunk
+        const SERVER_URL = 'http://13.232.170.194:8000'; // Add server URL constant
+
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const errorDiv = document.getElementById('error');
+
+        let frameQueue = [];
+        let lastFrameTime = 0;
+        let frameInterval = null;
+        const FPS = 30;
+        const FRAME_DURATION = 1000 / FPS;
+
+        // Add IMAGE_PATH and AUDIO_PATH constants
+        const IMAGE_PATH = '/examples/source_image/sad.png';
+        const AUDIO_PATH = '/examples/driven_audio/chinese_poem1.wav';
+
+        // Initialize audio context
+        async function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            return audioContext;
+        }
+
+        // Load and decode audio for a specific chunk
+        async function loadChunkAudio(chunkIndex, audioUrl) {
+            try {
+                // Fix the audio URL to use the server URL
+                const fullAudioUrl = audioUrl.startsWith('http') ? audioUrl : `${SERVER_URL}${audioUrl}`;
+                console.log(`Loading audio from: ${fullAudioUrl}`);
+                
+                const response = await fetch(fullAudioUrl);
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText}`);
+                }
+                
+                const arrayBuffer = await response.arrayBuffer();
+                const buffer = await audioContext.decodeAudioData(arrayBuffer);
+                chunkAudioBuffers.set(chunkIndex, buffer);
+                pendingChunks.delete(chunkIndex); // Remove from pending chunks
+                console.log(`Audio loaded for chunk ${chunkIndex}`);
+                return true;
+            } catch (error) {
+                console.error(`Error loading audio for chunk ${chunkIndex}:`, error);
+                pendingChunks.delete(chunkIndex); // Remove from pending even on error
+                return false;
+            }
+        }
+
+        // Play audio for a specific chunk
+        async function playChunkAudio(chunkIndex) {
+            if (!audioContext || currentChunkIndex === chunkIndex) return;
+            
+            try {
+                // Stop any currently playing audio
+                if (audioSource) {
+                    audioSource.stop();
+                    audioSource.disconnect();
+                }
+
+                // If audio is still loading, wait for it
+                if (pendingChunks.has(chunkIndex)) {
+                    console.log(`Waiting for audio to load for chunk ${chunkIndex}`);
+                    return;
+                }
+
+                const buffer = chunkAudioBuffers.get(chunkIndex);
+                if (!buffer) {
+                    console.log(`No audio buffer found for chunk ${chunkIndex}, will retry when available`);
+                    pendingChunks.add(chunkIndex);
+                    return;
+                }
+
+                // Create and configure audio source
+                audioSource = audioContext.createBufferSource();
+                audioSource.buffer = buffer;
+                audioSource.connect(audioContext.destination);
+                
+                // Calculate start time based on chunk index
+                const chunkStartTime = chunkIndex * CHUNK_DURATION;
+                const currentTime = audioContext.currentTime;
+                
+                // Start audio playback
+                audioSource.start(0, 0, CHUNK_DURATION); // Play for exactly CHUNK_DURATION seconds
+                audioStartTime = currentTime;
+                currentChunkIndex = chunkIndex;
+                isAudioPlaying = true;
+                
+                console.log(`Started audio playback for chunk ${chunkIndex} at ${currentTime.toFixed(2)}s, duration: ${CHUNK_DURATION}s`);
+
+                // Set up automatic stop after chunk duration
+                audioSource.onended = () => {
+                    console.log(`Audio playback completed for chunk ${chunkIndex}`);
+                    isAudioPlaying = false;
+                    currentChunkIndex = -1;
+                };
+            } catch (error) {
+                console.error(`Error playing audio for chunk ${chunkIndex}:`, error);
+                updateStatus(`Error playing audio for chunk ${chunkIndex}: ${error.message}`, true);
+            }
+        }
+
+        // Stop audio playback
+        function stopAudio() {
+            if (audioSource) {
+                try {
+                    audioSource.stop();
+                    audioSource.disconnect();
+                } catch (error) {
+                    console.error('Error stopping audio:', error);
+                }
+                audioSource = null;
+            }
+            isAudioPlaying = false;
+            currentChunkIndex = -1;
+            chunkAudioBuffers.clear();
+        }
+
+        function updateStatus(message, isError = false) {
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${isError ? 'disconnected' : 'connected'}`;
+            if (isError) {
+                errorDiv.textContent = message;
+                errorDiv.style.display = 'block';
+            } else {
+                errorDiv.style.display = 'none';
+            }
+        }
+
+        function showLoading() {
+            loadingSpinner.style.display = 'block';
+        }
+
+        function hideLoading() {
+            loadingSpinner.style.display = 'none';
+        }
+
+        function displayFrame(frameData) {
+            try {
+                const img = new Image();
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    // Hide loading spinner as soon as first frame is displayed
+                    if (loadingSpinner.style.display === 'block') {
+                        hideLoading();
+                    }
+                };
+                img.onerror = (error) => {
+                    console.error('Error loading frame:', error);
+                };
+                // Remove any potential data URL prefix
+                const base64Data = frameData.replace(/^data:image\/jpeg;base64,/, '');
+                img.src = 'data:image/jpeg;base64,' + base64Data;
+            } catch (error) {
+                console.error('Error displaying frame:', error);
+            }
+        }
+
+        function startFramePlayback() {
+            if (frameInterval) {
+                clearInterval(frameInterval);
+            }
+            
+            let lastFrameTime = performance.now();
+            const targetFrameTime = 1000 / FPS;
+            
+            function processNextFrame() {
+                const currentTime = performance.now();
+                const elapsed = currentTime - lastFrameTime;
+                
+                if (frameQueue.length > 0) {
+                    const frame = frameQueue.shift();
+                    displayFrame(frame.data);
+                    
+                    // Update status with progress if available
+                    if (frame.progress) {
+                        const { current, total, percentage } = frame.progress;
+                        updateStatus(`Playing chunk ${current}/${total} (${percentage}%)`);
+                    }
+                    
+                    // Handle audio playback for new chunks
+                    if (frame.chunkIndex !== currentChunkIndex) {
+                        console.log(`Switching to chunk ${frame.chunkIndex} at frame ${frame.frameIndex}`);
+                        playChunkAudio(frame.chunkIndex).catch(error => {
+                            console.error('Error starting chunk audio playback:', error);
+                        });
+                    }
+                    
+                    lastFrameTime = currentTime;
+                }
+                
+                const nextFrameDelay = Math.max(0, targetFrameTime - (performance.now() - currentTime));
+                frameInterval = setTimeout(processNextFrame, nextFrameDelay);
+            }
+            
+            processNextFrame();
+        }
+
+        function stopFramePlayback() {
+            if (frameInterval) {
+                clearInterval(frameInterval);
+                frameInterval = null;
+            }
+            frameQueue = [];
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            stopAudio();
+            console.log('Frame playback stopped');
+        }
+
+        async function connectWebSocket() {
+            return new Promise((resolve, reject) => {
+                try {
+                    ws = new WebSocket('ws://13.232.170.194:8000/generate/stream');
+                    
+                    ws.onopen = () => {
+                        console.log('WebSocket connected');
+                        reconnectAttempts = 0;
+                        resolve(ws);
+                    };
+                    
+                    ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        reject(error);
+                    };
+                    
+                    ws.onclose = (event) => {
+                        console.log('WebSocket closed:', event.code, event.reason);
+                        if (event.code === 1005 || event.code === 1006) {
+                            console.log('Connection closed unexpectedly');
+                        }
+                        reject(new Error(`WebSocket closed: ${event.code} ${event.reason}`));
+                    };
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        }
+
+        async function startStreaming() {
+            if (isStreaming) return;
+            
+            try {
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                updateStatus('Connecting...');
+                showLoading();
+                
+                // Initialize audio context
+                await initAudioContext();
+                
+                // Clear any existing audio buffers and pending chunks
+                chunkAudioBuffers.clear();
+                pendingChunks.clear();
+                
+                // Try to connect with retries
+                while (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    try {
+                        await connectWebSocket();
+                        break;
+                    } catch (error) {
+                        reconnectAttempts++;
+                        console.log(`Connection attempt ${reconnectAttempts} failed:`, error);
+                        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                            throw new Error('Failed to connect after multiple attempts');
+                        }
+                        await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+                    }
+                }
+                
+                isStreaming = true;
+                updateStatus('Connected');
+                
+                // Send image
+                try {
+                    updateStatus('Loading image...');
+                    const imageResponse = await fetch(IMAGE_PATH);
+                    if (!imageResponse.ok) {
+                        throw new Error(`Failed to load image (${imageResponse.status}): ${imageResponse.statusText}`);
+                    }
+                    const imageBlob = await imageResponse.blob();
+                    console.log('Image loaded, size:', imageBlob.size, 'bytes');
+                    ws.send(await imageBlob.arrayBuffer());
+                    console.log('Image sent successfully');
+                    updateStatus('Image sent, waiting for server...');
+                } catch (error) {
+                    console.error('Error loading image:', error);
+                    updateStatus('Error loading image: ' + error.message, true);
+                    stopStreaming();
+                    return;
+                }
+                
+                // Set up message handler
+                ws.onmessage = async (event) => {
+                    try {
+                        if (event.data instanceof Blob) {
+                            console.log('Received binary data');
+                        } else {
+                            const message = JSON.parse(event.data);
+                            console.log('Received message:', message);
+                            
+                            if (message.type === 'audio_ready') {
+                                try {
+                                    const audioUrl = message.audio_url;
+                                    const chunkIndex = message.chunk_index;
+                                    console.log(`Audio ready for chunk ${chunkIndex} from ${audioUrl}`);
+                                    
+                                    // Add to pending chunks before loading
+                                    pendingChunks.add(chunkIndex);
+                                    
+                                    // Try to load the audio
+                                    const audioLoaded = await loadChunkAudio(chunkIndex, audioUrl);
+                                    if (!audioLoaded) {
+                                        console.warn(`Failed to load audio for chunk ${chunkIndex}, will retry when frames arrive`);
+                                    } else {
+                                        // Try to play audio if this is the current chunk
+                                        if (currentChunkIndex === chunkIndex) {
+                                            await playChunkAudio(chunkIndex);
+                                        }
+                                    }
+                                } catch (error) {
+                                    console.error('Error handling audio_ready message:', error);
+                                    updateStatus('Error loading audio: ' + error.message, true);
+                                }
+                            } else if (message.type === 'frame') {
+                                // Add frame to queue with all metadata
+                                frameQueue.push({
+                                    data: message.data,
+                                    chunkIndex: message.chunk_index || 0, // Default to chunk 0 if not specified
+                                    frameIndex: message.frame_index,
+                                    timestamp: message.timestamp,
+                                    progress: message.progress
+                                });
+                                
+                                // Start playback if not already started
+                                if (!frameInterval) {
+                                    console.log('Starting frame playback');
+                                    startFramePlayback();
+                                }
+                            } else {
+                                switch (message.type) {
+                                    case 'ready_for_audio':
+                                        try {
+                                            const audioResponse = await fetch(AUDIO_PATH);
+                                            if (!audioResponse.ok) {
+                                                throw new Error(`Failed to load audio (${audioResponse.status}): ${audioResponse.statusText}`);
+                                            }
+                                            const audioBlob = await audioResponse.blob();
+                                            console.log('Audio loaded, size:', audioBlob.size, 'bytes');
+                                            ws.send(await audioBlob.arrayBuffer());
+                                            console.log('Audio sent successfully');
+                                            updateStatus('Audio sent, processing...');
+                                        } catch (error) {
+                                            console.error('Error sending audio:', error);
+                                            updateStatus('Error sending audio: ' + error.message, true);
+                                            stopStreaming();
+                                        }
+                                        break;
+                                        
+                                    case 'processing_started':
+                                        updateStatus('Processing started');
+                                        break;
+                                        
+                                    case 'error':
+                                        updateStatus('Error: ' + message.error, true);
+                                        stopStreaming();
+                                        break;
+                                        
+                                    case 'processing_complete':
+                                        updateStatus('Processing complete');
+                                        break;
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error handling message:', error);
+                        updateStatus('Error processing message: ' + error.message, true);
+                    }
+                };
+                
+            } catch (error) {
+                console.error('Error starting stream:', error);
+                updateStatus('Error starting stream: ' + error.message, true);
+                stopStreaming();
+            }
+        }
+
+        function stopStreaming() {
+            if (ws) {
+                try {
+                    ws.close(1000, 'Client stopping stream');
+                } catch (error) {
+                    console.error('Error closing WebSocket:', error);
+                }
+                ws = null;
+            }
+            
+            stopFramePlayback();
+            stopAudio();
+            isStreaming = false;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            updateStatus('Disconnected');
+        }
+    </script>
+</body>
+</html> 
