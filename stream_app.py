@@ -453,8 +453,12 @@ def process_chunk_sync(client_id: str, source_image: str, audio_chunk_path: str,
 async def get_chunk_audio(client_id: str, chunk_index: int):
     """Get audio stream for a specific chunk"""
     try:
-        # Find the video file
+        # Find the video file in the results directory
         chunk_dir = os.path.join("results", client_id, f"chunk_{chunk_index}")
+        if not os.path.exists(chunk_dir):
+            raise HTTPException(status_code=404, detail=f"Chunk directory not found: {chunk_dir}")
+            
+        # Search for video file recursively
         video_files = []
         for root, _, files in os.walk(chunk_dir):
             for file in files:
@@ -462,45 +466,52 @@ async def get_chunk_audio(client_id: str, chunk_index: int):
                     video_files.append(os.path.join(root, file))
         
         if not video_files:
-            raise HTTPException(status_code=404, detail="No video file found")
+            raise HTTPException(status_code=404, detail="No video file found for chunk")
             
         video_path = video_files[0]
+        logger.info(f"Found video file for chunk {chunk_index}: {video_path}")
         
-        # Extract audio using ffmpeg
-        temp_audio_path = os.path.join("temp", f"{client_id}_chunk_{chunk_index}_audio.mp3")
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-vn',  # No video
-            '-acodec', 'libmp3lame',  # Use MP3 codec
-            '-ab', '192k',  # Audio bitrate
-            temp_audio_path
-        ]
-        subprocess.run(cmd, capture_output=True)
+        # Create a permanent audio directory in results
+        audio_dir = os.path.join("results", client_id, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_path = os.path.join(audio_dir, f"chunk_{chunk_index}_audio.mp3")
         
-        if not os.path.exists(temp_audio_path):
-            raise HTTPException(status_code=500, detail="Failed to extract audio")
+        # Only extract audio if it doesn't exist
+        if not os.path.exists(audio_path):
+            logger.info(f"Extracting audio from video for chunk {chunk_index}")
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-vn',  # No video
+                '-acodec', 'libmp3lame',  # Use MP3 codec
+                '-ab', '192k',  # Audio bitrate
+                audio_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                raise HTTPException(status_code=500, detail="Failed to extract audio from video")
             
+            if not os.path.exists(audio_path):
+                raise HTTPException(status_code=500, detail="Audio extraction failed")
+                
+        logger.info(f"Serving audio file: {audio_path}")
         return FileResponse(
-            temp_audio_path,
+            audio_path,
             media_type="audio/mpeg",
             filename=f"chunk_{chunk_index}_audio.mp3",
             headers={
                 "X-Chunk-Index": str(chunk_index),
-                "X-Client-ID": client_id
+                "X-Client-ID": client_id,
+                "Cache-Control": "public, max-age=3600"  # Cache for 1 hour
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting chunk audio: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up temp audio file
-        if os.path.exists(temp_audio_path):
-            try:
-                os.remove(temp_audio_path)
-            except:
-                pass
 
 async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str, total_chunks: int, websocket: WebSocket):
     """Stream frames for a processed chunk"""
@@ -508,14 +519,54 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found at {video_path}")
             
-        # Verify file is readable
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file {video_path}")
-            
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Create frames directory for this chunk
+        frames_dir = os.path.join("results", client_id, f"chunk_{chunk_index}", "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        
+        # Create audio directory
+        audio_dir = os.path.join("results", client_id, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        
+        # Extract audio from video
+        audio_path = os.path.join(audio_dir, f"chunk_{chunk_index}_audio.mp3")
+        if not os.path.exists(audio_path):
+            logger.info(f"Extracting audio for chunk {chunk_index}")
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-vn',
+                '-acodec', 'libmp3lame',
+                '-ab', '192k',
+                audio_path
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+        
+        # Extract frames from video
+        logger.info(f"Extracting frames for chunk {chunk_index}")
+        frame_pattern = os.path.join(frames_dir, "frame_%03d.png")
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-vf', 'fps=30',  # Extract at 30fps
+            frame_pattern
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+        
+        # Merge frames and audio using FFmpeg
+        merged_video_path = os.path.join("results", client_id, f"chunk_{chunk_index}", "merged.mp4")
+        logger.info(f"Merging frames and audio for chunk {chunk_index}")
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', '30',
+            '-i', frame_pattern,
+            '-i', audio_path,
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-strict', 'experimental',
+            '-pix_fmt', 'yuv420p',
+            merged_video_path
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
         
         # Send audio URL before starting frame stream
         audio_url = f"/audio/chunk/{client_id}/{chunk_index}"
@@ -523,10 +574,12 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
             "type": "audio_ready",
             "audio_url": audio_url,
             "chunk_index": chunk_index,
-            "fps": fps,
-            "frame_count": frame_count
+            "fps": 30,  # We're using fixed 30fps
+            "frame_count": len([f for f in os.listdir(frames_dir) if f.startswith("frame_")])
         })
-            
+        
+        # Stream the merged video
+        cap = cv2.VideoCapture(merged_video_path)
         try:
             frame_index = 0
             while cap.isOpened():
@@ -542,7 +595,7 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
                 frame_base64 = base64.b64encode(buffer).decode('utf-8')
                 
                 # Calculate timestamp for audio sync
-                timestamp = frame_index / fps
+                timestamp = frame_index / 30.0  # Using fixed 30fps
                 
                 # Send frame through websocket
                 await websocket.send_json({
@@ -560,10 +613,15 @@ async def stream_chunk_frames(client_id: str, chunk_index: int, video_path: str,
                 
                 frame_index += 1
                 # Small delay to control frame rate
-                await asyncio.sleep(1/fps)  # Use actual video FPS
+                await asyncio.sleep(1/30.0)  # Using fixed 30fps
                 
         finally:
             cap.release()
+            # Clean up frames directory
+            try:
+                shutil.rmtree(frames_dir)
+            except Exception as e:
+                logger.warning(f"Error cleaning up frames directory: {str(e)}")
             
     except Exception as e:
         logger.error(f"Error streaming chunk {chunk_index}: {str(e)}", exc_info=True)
